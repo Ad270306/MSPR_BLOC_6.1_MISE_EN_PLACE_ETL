@@ -1,0 +1,164 @@
+import os
+import pandas as pd
+
+# ----------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------
+DAY_FILE = "trains_europe_clean.csv"          # trains de jour (France)
+NIGHT_FILE = "Night Train Database.csv"       # trains de nuit
+GTFS_FOLDER = "gtfs_europe"                   # dossier du GTFS CD+13
+OUTPUT_FILE = "trains_europe_final_clean.csv" # fichier final harmonisé
+
+
+# ----------------------------------------------------
+# CHARGEMENT DES TRAINS DE JOUR (FRANCE)
+# ----------------------------------------------------
+def load_day_trains():
+    print("Chargement des trains de jour (France)...")
+    df = pd.read_csv(DAY_FILE)
+
+    df.columns = df.columns.str.strip()
+    df.drop_duplicates(inplace=True)
+
+    df["category"] = "jour"
+    df["source"] = "SNCF_France"
+
+    print(df.head(5))
+    return df
+
+
+# ----------------------------------------------------
+# CHARGEMENT ET NETTOYAGE DES TRAINS DE NUIT (BACK-ON-TRACK)
+# ----------------------------------------------------
+def load_night_trains():
+    print("Chargement des trains de nuit (Back-on-Track)...")
+    df = pd.read_csv(NIGHT_FILE)
+
+    df.columns = [
+        "train_code", "name", "itinerary",
+        "details_html", "route_html",
+        "countries", "operator", "tickets_html"
+    ]
+
+    df["details"] = df["details_html"].str.replace(r"<.*?>", "", regex=True)
+    df["route"] = df["route_html"].str.replace(r"<.*?>", "", regex=True)
+    df["tickets_url"] = df["tickets_html"].str.extract(r'href="([^"]+)"')
+
+    df.drop(columns=["details_html", "route_html", "tickets_html"], inplace=True)
+
+    df.columns = df.columns.str.strip()
+    df.drop_duplicates(inplace=True)
+
+    df["category"] = "nuit"
+    df["source"] = "BackOnTrack"
+
+    print(df.head(5))
+    return df
+
+
+# ----------------------------------------------------
+# CHARGEMENT DU GTFS EUROPÉEN (CD+13)
+# ----------------------------------------------------
+def load_european_trains():
+    print("Chargement du GTFS européen (CD+13)...")
+
+    routes = pd.read_csv(f"{GTFS_FOLDER}/routes.txt")
+    trips = pd.read_csv(f"{GTFS_FOLDER}/trips.txt")
+
+    print("Filtrage des trains longue distance...")
+
+    trains = routes[routes["route_type"].isin([2, 3])]
+    df = trains.merge(trips, on="route_id", how="left")
+
+    df.columns = df.columns.str.strip()
+    df.drop_duplicates(inplace=True)
+
+    df["category"] = "jour"
+    df["source"] = "GTFS_Europe"
+
+    print(df.head(5))
+    return df
+
+
+# ----------------------------------------------------
+# FUSION DES DATASETS
+# ----------------------------------------------------
+def merge_datasets(df_day, df_night, df_europe):
+    print("Fusion des datasets...")
+
+    df_final = pd.concat([df_day, df_night, df_europe], ignore_index=True)
+
+    df_final.columns = df_final.columns.str.strip()
+    df_final.drop_duplicates(inplace=True)
+
+    return df_final
+
+
+# ----------------------------------------------------
+# HARMONISATION DES COLONNES (NETTOYAGE FINAL)
+# ----------------------------------------------------
+def harmonize(df):
+    print("Harmonisation des colonnes...")
+
+    df["train_id"] = df["trip_id"].fillna(df.get("train_code"))
+
+    df["train_name"] = (
+        df.get("route_long_name")
+        .fillna(df.get("name"))
+        .fillna(df["train_id"])
+    )
+
+    df["origin"] = (
+        df.get("trip_headsign")
+        .fillna(df.get("itinerary"))
+        .fillna(df.get("stop_name"))
+    )
+
+    df["destination"] = df["origin"]
+
+    df["category"] = df["category"].fillna("jour")
+    df["source"] = df["source"].fillna("SNCF_France")
+
+    df["country"] = df["source"].map({
+        "SNCF_France": "FR",
+        "BackOnTrack": "EU",
+        "GTFS_Europe": "EU"
+    }).fillna("EU")
+
+    df["operator"] = (
+        df.get("agency_id")
+        .fillna(df.get("operator"))
+        .fillna("SNCF")
+    )
+
+    df["route_type"] = df.get("route_type").fillna("rail")
+
+    df_final = df[[
+        "train_id", "train_name", "origin", "destination",
+        "category", "source", "country", "operator", "route_type"
+    ]].drop_duplicates()
+
+    print(df_final.head(10))
+    return df_final
+
+
+# ----------------------------------------------------
+# PIPELINE COMPLET
+# ----------------------------------------------------
+def run_etl():
+    df_day = load_day_trains()
+    df_night = load_night_trains()
+    df_europe = load_european_trains()
+
+    df_final = merge_datasets(df_day, df_night, df_europe)
+    df_final = harmonize(df_final)
+
+    df_final.to_csv(OUTPUT_FILE, index=False)
+    print(f"Fichier final harmonisé créé : {OUTPUT_FILE}")
+
+    return df_final
+
+
+# Lancer l’ETL
+if __name__ == "__main__":
+    run_etl()
