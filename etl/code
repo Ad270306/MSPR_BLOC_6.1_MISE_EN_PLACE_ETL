@@ -159,7 +159,30 @@ def harmonize(df):
         "category", "source", "country", "operator", "route_type"
     ]].drop_duplicates()
 
-    print(df_final.head(10))
+    # ----------------------------------------------------
+    # AFFICHAGE DES HORAIRES FRANÇAIS
+    # ----------------------------------------------------
+    df_fr = df_final[df_final["source"] == "SNCF_France"]
+
+    print("\nHoraires des trains français (SNCF) :")
+    print(df_fr[[
+        "train_id", "train_name",
+        "arrival_time", "departure_time",
+        "stop_sequence", "stop_name"
+    ]].head(20))
+
+    # ----------------------------------------------------
+    # AFFICHAGE DES HORAIRES EUROPÉENS
+    # ----------------------------------------------------
+    df_eu = df_final[df_final["source"] == "GTFS_Europe"]
+
+    print("\nHoraires des trains européens (GTFS Europe) :")
+    print(df_eu[[
+        "train_id", "train_name",
+        "arrival_time", "departure_time",
+        "stop_sequence", "stop_name"
+    ]].head(20))
+
     return df_final
 
 
