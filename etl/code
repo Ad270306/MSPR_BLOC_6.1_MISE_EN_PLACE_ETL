@@ -57,13 +57,15 @@ def load_night_trains():
 
 
 # ----------------------------------------------------
-# CHARGEMENT DU GTFS EUROPÉEN (CD+13)
+# CHARGEMENT DU GTFS EUROPÉEN (CD+13) + HORAIRES
 # ----------------------------------------------------
 def load_european_trains():
     print("Chargement du GTFS européen (CD+13)...")
 
     routes = pd.read_csv(f"{GTFS_FOLDER}/routes.txt")
     trips = pd.read_csv(f"{GTFS_FOLDER}/trips.txt")
+    stops = pd.read_csv(f"{GTFS_FOLDER}/stops.txt")
+    stop_times = pd.read_csv(f"{GTFS_FOLDER}/stop_times.txt")
 
     print("Filtrage des trains longue distance...")
 
@@ -75,6 +77,21 @@ def load_european_trains():
 
     df["category"] = "jour"
     df["source"] = "GTFS_Europe"
+
+    # ----------------------------------------------------
+    # AJOUT DES HORAIRES
+    # ----------------------------------------------------
+    df_times = stop_times.merge(stops, on="stop_id", how="left")
+
+    df_times = df_times[[
+        "trip_id",
+        "arrival_time",
+        "departure_time",
+        "stop_sequence",
+        "stop_name"
+    ]]
+
+    df = df.merge(df_times, on="trip_id", how="left")
 
     print(df.head(5))
     return df
@@ -133,8 +150,12 @@ def harmonize(df):
 
     df["route_type"] = df.get("route_type").fillna("rail")
 
+    # ----------------------------------------------------
+    # Colonnes finales AVEC HORAIRES
+    # ----------------------------------------------------
     df_final = df[[
         "train_id", "train_name", "origin", "destination",
+        "arrival_time", "departure_time", "stop_sequence", "stop_name",
         "category", "source", "country", "operator", "route_type"
     ]].drop_duplicates()
 
