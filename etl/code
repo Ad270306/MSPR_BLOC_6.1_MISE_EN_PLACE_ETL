@@ -117,73 +117,58 @@ def merge_datasets(df_day, df_night, df_europe):
 def harmonize(df):
     print("Harmonisation des colonnes...")
 
+    # Identifiants et noms
     df["train_id"] = df["trip_id"].fillna(df.get("train_code"))
-
     df["train_name"] = (
         df.get("route_long_name")
         .fillna(df.get("name"))
         .fillna(df["train_id"])
     )
 
+    # Origine / destination
     df["origin"] = (
         df.get("trip_headsign")
         .fillna(df.get("itinerary"))
         .fillna(df.get("stop_name"))
     )
-
     df["destination"] = df["origin"]
 
+    # Métadonnées
     df["category"] = df["category"].fillna("jour")
     df["source"] = df["source"].fillna("SNCF_France")
-
     df["country"] = df["source"].map({
         "SNCF_France": "FR",
         "BackOnTrack": "EU",
         "GTFS_Europe": "EU"
     }).fillna("EU")
-
     df["operator"] = (
         df.get("agency_id")
         .fillna(df.get("operator"))
         .fillna("SNCF")
     )
 
-    df["route_type"] = df.get("route_type").fillna("rail")
-
-    # ----------------------------------------------------
-    # Colonnes finales AVEC HORAIRES
-    # ----------------------------------------------------
+    # Colonnes essentielles uniquement
     df_final = df[[
-        "train_id", "train_name", "origin", "destination",
-        "arrival_time", "departure_time", "stop_sequence", "stop_name",
-        "category", "source", "country", "operator", "route_type"
+        "train_id",
+        "train_name",
+        "arrival_time",
+        "departure_time",
+        "stop_sequence",
+        "stop_name",
+        "category",
+        "source",
+        "operator"
     ]].drop_duplicates()
 
-    # ----------------------------------------------------
-    # AFFICHAGE DES HORAIRES FRANÇAIS
-    # ----------------------------------------------------
-    df_fr = df_final[df_final["source"] == "SNCF_France"]
-
+    # Aperçu France
     print("\nHoraires des trains français (SNCF) :")
-    print(df_fr[[
-        "train_id", "train_name",
-        "arrival_time", "departure_time",
-        "stop_sequence", "stop_name"
-    ]].head(20))
+    print(df_final[df_final["source"] == "SNCF_France"].head(20))
 
-    # ----------------------------------------------------
-    # AFFICHAGE DES HORAIRES EUROPÉENS
-    # ----------------------------------------------------
-    df_eu = df_final[df_final["source"] == "GTFS_Europe"]
-
+    # Aperçu Europe
     print("\nHoraires des trains européens (GTFS Europe) :")
-    print(df_eu[[
-        "train_id", "train_name",
-        "arrival_time", "departure_time",
-        "stop_sequence", "stop_name"
-    ]].head(20))
+    print(df_final[df_final["source"] == "GTFS_Europe"].head(20))
 
-    return df_final
+    return df_final 
 
 
 # ----------------------------------------------------
