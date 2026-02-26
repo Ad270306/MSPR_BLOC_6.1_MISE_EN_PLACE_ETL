@@ -1,10 +1,11 @@
 CREATE SCHEMA IF NOT EXISTS obrail;
 
--- Log d'exécution ETL (traçabilité)
+-- =========================================================
+-- ETL RUN LOG (traçabilité)
+-- =========================================================
 CREATE TABLE IF NOT EXISTS obrail.etl_run (
   run_id           BIGSERIAL PRIMARY KEY,
-  source_name      TEXT NOT NULL,
-  source_url       TEXT NOT NULL,
+  pipeline_name    TEXT NOT NULL DEFAULT 'etl_gtfs_to_postgres',
   started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   finished_at      TIMESTAMPTZ,
   status           TEXT NOT NULL DEFAULT 'RUNNING', -- RUNNING / SUCCESS / FAILED
@@ -13,24 +14,37 @@ CREATE TABLE IF NOT EXISTS obrail.etl_run (
   error_message    TEXT
 );
 
--- Table analytique : 1 ligne = 1 trip (départ/arrivée)
-CREATE TABLE IF NOT EXISTS obrail.fact_trip_summary (
-  trip_id               TEXT PRIMARY KEY,
-  source_name           TEXT NOT NULL,
+-- =========================================================
+-- TABLE FINALE : 1 ligne = 1 arrêt d’un trip (horaires)
+-- (parfait pour filtres, KPI, dashboard)
+-- =========================================================
+CREATE TABLE IF NOT EXISTS obrail.fact_train_stop (
+  -- Identifiants
+  train_id         TEXT NOT NULL,         -- harmonisé (trip_id ou train_code)
+  source           TEXT NOT NULL,         -- SNCF_France / BackOnTrack / GTFS_Europe
+  category         TEXT NOT NULL,         -- jour / nuit
+  operator         TEXT,                  -- SNCF / autre si dispo
 
-  dep_stop_name         TEXT NOT NULL,
-  arr_stop_name         TEXT NOT NULL,
+  -- Arrêt / horaires
+  stop_sequence    INT,                   -- ordre dans le trajet (GTFS)
+  stop_name        TEXT,                  -- nom de l’arrêt
+  arrival_time     TEXT,                  -- texte car peut dépasser 24:00:00
+  departure_time   TEXT,
 
-  departure_time        TEXT NOT NULL, -- GTFS peut dépasser 24:00:00
-  arrival_time          TEXT NOT NULL,
+  -- Champs optionnels (BackOnTrack)
+  route            TEXT,
+  details          TEXT,
+  tickets_url      TEXT,
+  countries        TEXT,
 
-  is_night_train        BOOLEAN NOT NULL,
-  duration_seconds_est  INT,
+  source_run_id    BIGINT NOT NULL REFERENCES obrail.etl_run(run_id),
+  loaded_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-  source_run_id         BIGINT NOT NULL REFERENCES obrail.etl_run(run_id),
-  loaded_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+  -- Empêche les doublons
+  CONSTRAINT pk_fact_train_stop PRIMARY KEY (train_id, source, stop_sequence, stop_name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_fact_dep_name ON obrail.fact_trip_summary(dep_stop_name);
-CREATE INDEX IF NOT EXISTS idx_fact_arr_name ON obrail.fact_trip_summary(arr_stop_name);
-CREATE INDEX IF NOT EXISTS idx_fact_is_night ON obrail.fact_trip_summary(is_night_train);
+CREATE INDEX IF NOT EXISTS idx_stop_name ON obrail.fact_train_stop(stop_name);
+CREATE INDEX IF NOT EXISTS idx_source ON obrail.fact_train_stop(source);
+CREATE INDEX IF NOT EXISTS idx_category ON obrail.fact_train_stop(category);
+CREATE INDEX IF NOT EXISTS idx_train_id ON obrail.fact_train_stop(train_id);

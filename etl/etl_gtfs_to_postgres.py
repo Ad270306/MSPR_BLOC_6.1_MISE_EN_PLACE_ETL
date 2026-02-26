@@ -1,212 +1,330 @@
-import pandas as pd
-import requests
-import zipfile
-import io
 import os
+import re
+import pandas as pd
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
 # =========================================================
-# CONFIG
+# PATHS (ta structure actuelle)
 # =========================================================
-GTFS_SOURCES = [
-    {"nom": "SNCF France", "url": "https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip"},
-]
+DAY_FILE = "data/raw/trains_europe_clean.csv"
+NIGHT_FILE = "data/raw/Night Train Database.csv"
+GTFS_FOLDER = "data/raw/gtfs_europe"
+OUTPUT_FILE = "data/processed/trains_europe_final_clean.csv"
 
-OUTPUT_FILE = "data/trains_europe_summary.csv"
+PIPELINE_NAME = "etl_train_stop_level"
 
-# Charge un .env si tu en crées un (optionnel)
+# =========================================================
+# DB
+# =========================================================
 load_dotenv()
-
-# Mets ton mot de passe postgres ici si tu veux (ou via .env)
 DB_URL = os.getenv("DB_URL", "postgresql+psycopg2://postgres:postgres@localhost:5432/obrail")
 
 # =========================================================
-# UTILS
+# ETL SOURCES (3)
 # =========================================================
-def parse_hhmmss_to_seconds(t: str):
-    """Convertit HH:MM:SS en secondes, supporte HH>24 (GTFS)."""
-    try:
-        h, m, s = t.split(":")
-        return int(h) * 3600 + int(m) * 60 + int(s)
-    except Exception:
-        return None
+SOURCES = [
+    {"name": "SNCF_France", "type": "DAY_CSV", "ref": DAY_FILE},
+    {"name": "BackOnTrack", "type": "NIGHT_CSV", "ref": NIGHT_FILE},
+    {"name": "GTFS_Europe", "type": "GTFS_FOLDER", "ref": GTFS_FOLDER},
+]
 
-def compute_is_night(dep_time: str, arr_time: str) -> bool:
-    """Règle simple: nuit si départ >= 20:00 ou arrivée <= 06:00."""
-    dep_s = parse_hhmmss_to_seconds(dep_time)
-    arr_s = parse_hhmmss_to_seconds(arr_time)
-    if dep_s is None or arr_s is None:
-        return False
-    return (dep_s >= 20 * 3600) or (arr_s <= 6 * 3600)
+# =========================================================
+# Helpers
+# =========================================================
+def ensure_dir(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+def strip_html(s: str) -> str | None:
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return None
+    return re.sub(r"<.*?>", "", str(s))
 
 # =========================================================
 # ETL RUN LOG
 # =========================================================
-def start_etl_run(engine, source_name: str, source_url: str) -> int:
+def start_etl_run(engine, pipeline_name: str, source_name: str, source_url: str) -> int:
     with engine.begin() as conn:
         res = conn.execute(
-            text("""INSERT INTO obrail.etl_run(source_name, source_url)
-                    VALUES (:n, :u) RETURNING run_id"""),
-            {"n": source_name, "u": source_url}
+            text("""
+                INSERT INTO obrail.etl_run(pipeline_name, source_name, source_url, status)
+                VALUES (:p, :n, :u, 'RUNNING')
+                RETURNING run_id
+            """),
+            {"p": pipeline_name, "n": source_name, "u": source_url}
         )
         return res.scalar()
 
 def finish_etl_run(engine, run_id: int, status: str, rows_extracted: int, rows_loaded: int, error_message: str | None = None):
     with engine.begin() as conn:
         conn.execute(
-            text("""UPDATE obrail.etl_run
-                    SET finished_at = now(),
-                        status = :st,
-                        rows_extracted = :re,
-                        rows_loaded = :rl,
-                        error_message = :err
-                    WHERE run_id = :id"""),
+            text("""
+                UPDATE obrail.etl_run
+                SET finished_at = now(),
+                    status = :st,
+                    rows_extracted = :re,
+                    rows_loaded = :rl,
+                    error_message = :err
+                WHERE run_id = :id
+            """),
             {"st": status, "re": rows_extracted, "rl": rows_loaded, "err": error_message, "id": run_id}
         )
 
 # =========================================================
-# 1) EXTRACT
+# LOAD 1: trains de jour (France) -> stop-level minimal
 # =========================================================
-def download_gtfs(url, nom_source):
-    print(f"📥 Téléchargement GTFS depuis {nom_source} : {url}")
-    if not url.startswith("http"):
-        print(f"   ⚠️ Pas un lien téléchargeable : {url}")
-        return None
-    try:
-        response = requests.get(url, timeout=120)
-        response.raise_for_status()
-        print(f"   ✅ Téléchargement réussi pour {nom_source}")
-        return io.BytesIO(response.content)
-    except requests.exceptions.RequestException as e:
-        print(f"   ❌ ERREUR HTTP pour {nom_source} : {e}")
-        return None
+def load_day_trains() -> pd.DataFrame:
+    print("🚆 Chargement trains de jour (France)...")
+    df = pd.read_csv(DAY_FILE)
+    df.columns = df.columns.str.strip()
 
-# =========================================================
-# 2) TRANSFORM
-# =========================================================
-def transform_gtfs_to_summary(gtfs_bytes, nom_source):
-    if not gtfs_bytes:
-        return pd.DataFrame()
+    # train_id
+    if "trip_id" in df.columns:
+        train_id = df["trip_id"].astype(str)
+    elif "train_id" in df.columns:
+        train_id = df["train_id"].astype(str)
+    else:
+        train_id = pd.Series(range(len(df))).astype(str)
 
-    print(f"🧹 Transformation GTFS {nom_source} (summary départ/arrivée)...")
+    # stop_name
+    stop_name = None
+    for c in ["stop_name", "origin", "dep_stop_name", "route_long_name", "name"]:
+        if c in df.columns:
+            stop_name = df[c].astype(str)
+            break
+    if stop_name is None:
+        stop_name = pd.Series(["UNKNOWN"] * len(df))
 
-    try:
-        with zipfile.ZipFile(gtfs_bytes) as z:
-            trips = pd.read_csv(z.open("trips.txt"))
-            stop_times = pd.read_csv(z.open("stop_times.txt"))
-            stops = pd.read_csv(z.open("stops.txt"))
-    except KeyError as e:
-        print(f"   ⚠️ Fichier manquant dans {nom_source} : {e}")
-        return pd.DataFrame()
-
-    # Jointure pour avoir stop_name
-    df = stop_times.merge(trips[["trip_id"]], on="trip_id", how="inner")
-    df = df.merge(stops[["stop_id", "stop_name"]], on="stop_id", how="left")
-
-    df = df[["trip_id", "stop_sequence", "stop_name", "arrival_time", "departure_time"]].copy()
-    df["source_name"] = nom_source
-
-    # Trier pour prendre 1er arrêt = départ ; dernier = arrivée
-    df_sorted = df.sort_values(["trip_id", "stop_sequence"])
-    df_depart = df_sorted.groupby("trip_id").first().reset_index()
-    df_arrivee = df_sorted.groupby("trip_id").last().reset_index()
-
-    df_final = pd.DataFrame({
-        "trip_id": df_depart["trip_id"],
-        "source_name": nom_source,
-        "dep_stop_name": df_depart["stop_name"],
-        "departure_time": df_depart["departure_time"],
-        "arr_stop_name": df_arrivee["stop_name"],
-        "arrival_time": df_arrivee["arrival_time"],
+    out = pd.DataFrame({
+        "train_id": train_id,
+        "source": "SNCF_France",
+        "category": "jour",
+        "operator": df["operator"].astype(str) if "operator" in df.columns else "SNCF",
+        "stop_sequence": df["stop_sequence"] if "stop_sequence" in df.columns else 1,
+        "stop_name": stop_name,
+        "arrival_time": df["arrival_time"] if "arrival_time" in df.columns else None,
+        "departure_time": df["departure_time"] if "departure_time" in df.columns else None,
+        "route": None,
+        "details": None,
+        "tickets_url": None,
+        "countries": None
     })
 
-    # Qualité minimale
-    df_final.dropna(subset=["dep_stop_name", "arr_stop_name", "departure_time", "arrival_time"], inplace=True)
-
-    # Features analytiques
-    df_final["is_night_train"] = df_final.apply(lambda r: compute_is_night(r["departure_time"], r["arrival_time"]), axis=1)
-
-    dep_s = df_final["departure_time"].apply(parse_hhmmss_to_seconds)
-    arr_s = df_final["arrival_time"].apply(parse_hhmmss_to_seconds)
-    df_final["duration_seconds_est"] = (arr_s - dep_s)
-
-    print(f"   ✅ {len(df_final)} trips résumés (départ/arrivée) pour {nom_source}")
-    return df_final
+    out.drop_duplicates(inplace=True)
+    print(f"   ✅ {len(out)} lignes (France)")
+    return out
 
 # =========================================================
-# 3) LOAD (PostgreSQL)
+# LOAD 2: trains de nuit (BackOnTrack) -> stop-level
 # =========================================================
-def load_summary_to_postgres(engine, df_summary: pd.DataFrame, run_id: int) -> int:
-    if df_summary.empty:
-        return 0
+def load_night_trains() -> pd.DataFrame:
+    print("🌙 Chargement trains de nuit (BackOnTrack)...")
+    df = pd.read_csv(NIGHT_FILE)
+    df.columns = df.columns.str.strip()
 
-    df_to_load = df_summary.copy()
-    df_to_load["source_run_id"] = run_id
+    # normalisation colonnes si fichier brut
+    if len(df.columns) >= 8 and "train_code" not in df.columns:
+        df = df.iloc[:, :8]
+        df.columns = [
+            "train_code", "name", "itinerary",
+            "details_html", "route_html",
+            "countries", "operator", "tickets_html"
+        ]
 
-    # Astuce MSPR: pour rejouabilité, on peut éviter les doublons en supprimant d'abord les trip_id de cette source_run
-    # Ici on fait simple: append. (On peut améliorer après)
-    df_to_load.to_sql(
-        "fact_trip_summary",
-        engine,
-        schema="obrail",
-        if_exists="append",
-        index=False,
-        method="multi"
-    )
-    return len(df_to_load)
+    # si ces colonnes n’existent pas, on sécurise
+    if "details_html" in df.columns:
+        df["details"] = df["details_html"].apply(strip_html)
+    else:
+        df["details"] = None
+
+    if "route_html" in df.columns:
+        df["route"] = df["route_html"].apply(strip_html)
+    else:
+        df["route"] = None
+
+    if "tickets_html" in df.columns:
+        df["tickets_url"] = df["tickets_html"].astype(str).str.extract(r'href="([^"]+)"')[0]
+    else:
+        df["tickets_url"] = None
+
+    out = pd.DataFrame({
+        "train_id": df["train_code"].astype(str) if "train_code" in df.columns else pd.Series(range(len(df))).astype(str),
+        "source": "BackOnTrack",
+        "category": "nuit",
+        "operator": df["operator"].astype(str) if "operator" in df.columns else None,
+        "stop_sequence": 1,
+        "stop_name": df["itinerary"].astype(str) if "itinerary" in df.columns else (df["name"].astype(str) if "name" in df.columns else "UNKNOWN"),
+        "arrival_time": None,
+        "departure_time": None,
+        "route": df["route"],
+        "details": df["details"],
+        "tickets_url": df["tickets_url"],
+        "countries": df["countries"].astype(str) if "countries" in df.columns else None
+    })
+
+    out.drop_duplicates(inplace=True)
+    print(f"   ✅ {len(out)} lignes (Night DB)")
+    return out
 
 # =========================================================
-# CSV SAVE (optionnel)
+# LOAD 3: GTFS Europe -> stop-level complet
 # =========================================================
-def save_csv(df, path):
-    if df.empty:
-        print("⚠️ Pas de données à sauvegarder.")
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_csv(path, index=False)
-    print(f"💾 Fichier CSV créé : {path}")
+def load_european_trains() -> pd.DataFrame:
+    print("🇪🇺 Chargement GTFS Europe (CD+13)...")
+
+    routes = pd.read_csv(os.path.join(GTFS_FOLDER, "routes.txt"))
+    trips = pd.read_csv(os.path.join(GTFS_FOLDER, "trips.txt"))
+    stops = pd.read_csv(os.path.join(GTFS_FOLDER, "stops.txt"))
+    stop_times = pd.read_csv(os.path.join(GTFS_FOLDER, "stop_times.txt"))
+
+    for d in [routes, trips, stops, stop_times]:
+        d.columns = d.columns.str.strip()
+
+    trains_routes = routes[routes["route_type"].isin([2, 3])].copy()
+    t = trains_routes.merge(trips, on="route_id", how="left")
+
+    st = stop_times.merge(stops[["stop_id", "stop_name"]], on="stop_id", how="left")
+    st = st[["trip_id", "arrival_time", "departure_time", "stop_sequence", "stop_name"]]
+
+    df = t.merge(st, on="trip_id", how="left")
+
+    operator = df["agency_id"].astype(str) if "agency_id" in df.columns else "UNKNOWN"
+
+    out = pd.DataFrame({
+        "train_id": df["trip_id"].astype(str),
+        "source": "GTFS_Europe",
+        "category": "jour",
+        "operator": operator,
+        "stop_sequence": df["stop_sequence"],
+        "stop_name": df["stop_name"].astype(str),
+        "arrival_time": df["arrival_time"],
+        "departure_time": df["departure_time"],
+        "route": df["route_long_name"].astype(str) if "route_long_name" in df.columns else None,
+        "details": None,
+        "tickets_url": None,
+        "countries": None
+    })
+
+    out.dropna(subset=["train_id"], inplace=True)
+    out.drop_duplicates(inplace=True)
+    print(f"   ✅ {len(out)} lignes (GTFS Europe)")
+    return out
+
+# =========================================================
+# MERGE + CLEAN
+# =========================================================
+def clean_types(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "stop_sequence" in df.columns:
+        df["stop_sequence"] = pd.to_numeric(df["stop_sequence"], errors="coerce").astype("Int64")
+
+    # strings
+    for c in ["train_id", "source", "category", "operator", "stop_name"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    return df
+
+# =========================================================
+# LOAD PostgreSQL (batch + upsert)
+# =========================================================
+def load_to_postgres(engine, df: pd.DataFrame, run_id: int) -> int:
+    df = df.copy()
+    df["source_run_id"] = run_id
+
+    sql = text("""
+        INSERT INTO obrail.fact_train_stop(
+            train_id, source, category, operator,
+            stop_sequence, stop_name, arrival_time, departure_time,
+            route, details, tickets_url, countries,
+            source_run_id
+        )
+        VALUES (
+            :train_id, :source, :category, :operator,
+            :stop_sequence, :stop_name, :arrival_time, :departure_time,
+            :route, :details, :tickets_url, :countries,
+            :source_run_id
+        )
+        ON CONFLICT (train_id, source, stop_sequence, stop_name) DO UPDATE
+        SET
+            category = EXCLUDED.category,
+            operator = EXCLUDED.operator,
+            arrival_time = EXCLUDED.arrival_time,
+            departure_time = EXCLUDED.departure_time,
+            route = EXCLUDED.route,
+            details = EXCLUDED.details,
+            tickets_url = EXCLUDED.tickets_url,
+            countries = EXCLUDED.countries,
+            source_run_id = EXCLUDED.source_run_id,
+            loaded_at = now();
+    """)
+
+    data = df.to_dict(orient="records")
+    rows = 0
+
+    with engine.begin() as conn:
+        for chunk_start in range(0, len(data), 5000):
+            chunk = data[chunk_start:chunk_start + 5000]
+            conn.execute(sql, chunk)
+            rows += len(chunk)
+
+    return rows
 
 # =========================================================
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    pd.set_option("display.max_rows", 50)
-    pd.set_option("display.max_columns", 20)
-    pd.set_option("display.width", 200)
+    print("============================================================")
+    print("START ETL (3 sources -> processed CSV + PostgreSQL)")
+    print("============================================================")
 
     engine = create_engine(DB_URL)
 
-    all_summaries = []
+    all_frames = []
     total_loaded = 0
+    total_extracted = 0
 
-    for src in GTFS_SOURCES:
-        run_id = start_etl_run(engine, src["nom"], src["url"])
+    for src in SOURCES:
+        # 1 run par source
+        run_id = start_etl_run(engine, PIPELINE_NAME, src["name"], src["ref"])
+
         try:
-            gtfs_data = download_gtfs(src["url"], src["nom"])
-            df_summary = transform_gtfs_to_summary(gtfs_data, src["nom"])
+            if src["type"] == "DAY_CSV":
+                df_part = load_day_trains()
+            elif src["type"] == "NIGHT_CSV":
+                df_part = load_night_trains()
+            elif src["type"] == "GTFS_FOLDER":
+                df_part = load_european_trains()
+            else:
+                df_part = pd.DataFrame()
 
-            rows_loaded = load_summary_to_postgres(engine, df_summary, run_id)
-            finish_etl_run(engine, run_id, "SUCCESS", len(df_summary), rows_loaded, None)
+            df_part = clean_types(df_part)
 
-            if not df_summary.empty:
-                all_summaries.append(df_summary)
-                total_loaded += rows_loaded
+            rows_extracted = len(df_part)
+            rows_loaded = load_to_postgres(engine, df_part, run_id)
+
+            finish_etl_run(engine, run_id, "SUCCESS", rows_extracted, rows_loaded, None)
+
+            all_frames.append(df_part)
+            total_extracted += rows_extracted
+            total_loaded += rows_loaded
+
+            print(f"✅ Source {src['name']} -> extracted={rows_extracted}, loaded={rows_loaded}, run_id={run_id}")
 
         except Exception as e:
             finish_etl_run(engine, run_id, "FAILED", 0, 0, str(e))
             raise
 
-    if all_summaries:
-        df_all = pd.concat(all_summaries, ignore_index=True)
-        save_csv(df_all, OUTPUT_FILE)
-
-        print("\n--- Aperçu (10 lignes) ---")
-        print(df_all.head(10))
-
-        print(f"\n✅ Total chargé en BDD : {total_loaded}")
+    # CSV final (concat)
+    if all_frames:
+        df_final = pd.concat(all_frames, ignore_index=True).drop_duplicates()
+        ensure_dir(OUTPUT_FILE)
+        df_final.to_csv(OUTPUT_FILE, index=False)
+        print(f"\n💾 CSV final créé: {OUTPUT_FILE} ({len(df_final)} lignes)")
     else:
-        print("⚠️ Aucune donnée transformée.")
+        print("\n⚠️ Aucune donnée à écrire dans le CSV final.")
 
-    print("\n" + "=" * 60)
-    print("FIN DU PROCESSUS ETL")
+    print("\n============================================================")
+    print(f"FIN ETL -> extracted={total_extracted} / loaded={total_loaded}")
+    print("============================================================")
