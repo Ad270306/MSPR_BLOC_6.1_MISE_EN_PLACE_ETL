@@ -78,9 +78,7 @@ def load_european_trains():
     df["category"] = "jour"
     df["source"] = "GTFS_Europe"
 
-    # ----------------------------------------------------
     # AJOUT DES HORAIRES
-    # ----------------------------------------------------
     df_times = stop_times.merge(stops, on="stop_id", how="left")
 
     df_times = df_times[[
@@ -168,7 +166,15 @@ def harmonize(df):
     print("\nHoraires des trains européens (GTFS Europe) :")
     print(df_final[df_final["source"] == "GTFS_Europe"].head(20))
 
-    return df_final 
+    # Aperçu Monaco / Italie
+    print("\nGares Monaco / Italie détectées :")
+    print(df_final[df_final["stop_name"].str.contains(
+        "Monaco|Vintimille|Ventimiglia|Italie",
+        case=False,
+        na=False
+    )].head(20))
+
+    return df_final
 
 
 # ----------------------------------------------------
@@ -188,6 +194,12 @@ def run_etl():
     return df_final
 
 
-# Lancer l’ETL
+# ----------------------------------------------------
+# AUTOMATISATION TOUTES LES 2 HEURES
+# ----------------------------------------------------
 if __name__ == "__main__":
-    run_etl()
+    import time
+    while True:
+        run_etl()
+        print("Prochaine exécution dans 2 heures...")
+        time.sleep(2 * 60 * 60)  # 2 heures
